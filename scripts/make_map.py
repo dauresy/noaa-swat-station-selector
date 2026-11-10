@@ -12,7 +12,7 @@ def make_map(stations, basin, buffer_km):
     m = folium.Map(
         location=[centroid.y, centroid.x],
         zoom_start=7,
-        tiles="CartoDB positron"
+        tiles="OpenStreetMap"
     )
 
     folium.GeoJson(

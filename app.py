@@ -35,6 +35,9 @@ from scripts.export_swatplus import export_swatplus
 EARLIEST_DATE = datetime.date(1900, 1, 1)
 TODAY         = datetime.date.today()
 
+# Free basemaps (CARTO "positron" now answers every tile with "API KEY REQUIRED").
+ESRI_TILES = "https://server.arcgisonline.com/ArcGIS/rest/services/{svc}/MapServer/tile/{{z}}/{{y}}/{{x}}"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODULE-LEVEL CACHED HELPERS
@@ -172,7 +175,15 @@ def run_app():
     step = st.sidebar.radio(
         T("Navigation", "Navegación"),
         ["1️⃣ Upload", "2️⃣ Parameters", "3️⃣ Results", "4️⃣ Analysis", "5️⃣ Export SWAT+"]
-    ) 
+    )
+
+    # Streamlit drops a widget's value when the widget is not drawn in a run (i.e. when
+    # you visit another step). Re-assigning the key keeps it, so folders and date
+    # ranges survive moving between steps.
+    for _k in ("noaa_folder_download", "dl_start", "dl_end", "exp_noaa_folder",
+               "exp_start", "exp_end", "exp_output_folder"):
+        if _k in st.session_state:
+            st.session_state[_k] = st.session_state[_k]
     
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 1 — Upload shapefile
@@ -211,62 +222,81 @@ def run_app():
                 """
             ))
 
+        # The uploader widget forgets its files as soon as you leave this step, but the
+        # basin itself lives in session_state. Show what is loaded, and only re-read
+        # the shapefile when the uploaded files actually change.
         uploaded_files = st.file_uploader(
             T("Upload all 4 shapefile components (.shp .shx .dbf .prj)",
-              "Sube los 4 componentes del shapefile (.shp .shx .dbf .prj)"),
+              "Sube los 4 componentes del shapefile (.shp .shx .dbf .prj)")
+            if "basin" not in st.session_state else
+            T("Replace the loaded shapefile (upload all 4 components)",
+              "Reemplazar el shapefile cargado (sube los 4 componentes)"),
             type=["shp", "shx", "dbf", "prj"],
-            accept_multiple_files=True
+            accept_multiple_files=True,
+            key=f"shp_uploader_{st.session_state.get('uploader_gen', 0)}",
         )
 
         if uploaded_files:
+            upload_sig = tuple(sorted((f.name, f.size) for f in uploaded_files))
 
-            if "basin" in st.session_state:
-                st.warning(T("Replacing previous shapefile…",
-                             "Reemplazando shapefile anterior…"))
-                for key in ["basin", "stations_thinned", "basin_buffer",
-                            "final_map", "run", "area_km2"]:
+            if st.session_state.get("basin_sig") != upload_sig:
+                required_ext = {".shp", ".shx", ".dbf", ".prj"}
+                uploaded_ext = {os.path.splitext(f.name)[1].lower() for f in uploaded_files}
+                missing_ext = required_ext - uploaded_ext
+                if missing_ext:
+                    st.error(T(
+                        f"Missing components: {missing_ext}. Please upload all four files.",
+                        f"Faltan componentes: {missing_ext}. Sube los cuatro archivos."
+                    ))
+                    st.stop()
+
+                temp_dir = tempfile.mkdtemp()
+                for f in uploaded_files:
+                    with open(os.path.join(temp_dir, f.name), "wb") as out:
+                        out.write(f.getvalue())
+
+                shp_path = next(
+                    os.path.join(temp_dir, f.name)
+                    for f in uploaded_files if f.name.lower().endswith(".shp")
+                )
+                basin = load_shapefile(shp_path)
+
+                if basin.crs is None:
+                    st.warning(T(
+                        "No CRS detected. Assigning Miller Cylindrical (ESRI:54003).",
+                        "Sin CRS detectado. Asignando Miller Cylindrical (ESRI:54003)."
+                    ))
+                    basin = basin.set_crs("ESRI:54003")
+                basin = basin.to_crs(4326)
+
+                # A different basin invalidates everything derived from the old one.
+                for key in ["stations_thinned", "basin_buffer", "final_map", "run",
+                            "results_map", "results_map_sig"]:
                     st.session_state.pop(key, None)
 
-            required_ext = {".shp", ".shx", ".dbf", ".prj"}
-            uploaded_ext = {os.path.splitext(f.name)[1].lower() for f in uploaded_files}
-            missing_ext = required_ext - uploaded_ext
-            if missing_ext:
-                st.error(T(
-                    f"Missing components: {missing_ext}. Please upload all four files.",
-                    f"Faltan componentes: {missing_ext}. Sube los cuatro archivos."
-                ))
-                st.stop()
+                st.session_state["basin"]      = basin
+                st.session_state["basin_sig"]  = upload_sig
+                st.session_state["basin_name"] = os.path.basename(shp_path)
+                st.session_state["area_km2"]   = basin.to_crs("EPSG:6933").geometry.area.sum() / 1e6  # equal-area, any location
 
-            temp_dir = tempfile.mkdtemp()
-            for f in uploaded_files:
-                with open(os.path.join(temp_dir, f.name), "wb") as out:
-                    out.write(f.read())
-
-            shp_path = next(
-                os.path.join(temp_dir, f.name)
-                for f in uploaded_files if f.name.endswith(".shp")
-            )
-            basin = load_shapefile(shp_path)
-
-            if basin.crs is None:
-                st.warning(T(
-                    "No CRS detected. Assigning Miller Cylindrical (ESRI:54003).",
-                    "Sin CRS detectado. Asignando Miller Cylindrical (ESRI:54003)."
-                ))
-                basin = basin.set_crs("ESRI:54003")
-
-            basin = basin.to_crs(4326)
-            st.session_state["basin"] = basin
-
-            # ── Basin diagnostics ──────────────────────────────────────────
-            st.success(T("✅ Shapefile loaded!", "✅ ¡Shapefile cargado!"))
-
-            area_km2     = basin.to_crs("EPSG:6933").geometry.area.sum() / 1e6  # equal-area, any location
-            n_subs       = len(basin)
-            bounds       = basin.total_bounds
+        # ── Loaded basin (stays visible while you change parameters) ───────────
+        if "basin" in st.session_state:
+            basin    = st.session_state["basin"]
+            area_km2 = st.session_state["area_km2"]
+            n_subs   = len(basin)
+            bounds   = basin.total_bounds
             rec_stations = max(4, int(area_km2 / 575))  # WMO plains standard
 
-            st.session_state["area_km2"] = area_km2
+            col_ok, col_clear = st.columns([5, 1])
+            col_ok.success(T(
+                f"✅ Shapefile loaded: {st.session_state.get('basin_name', '')}",
+                f"✅ Shapefile cargado: {st.session_state.get('basin_name', '')}"))
+            if col_clear.button(T("🗑️ Remove", "🗑️ Quitar"), use_container_width=True):
+                for key in ["basin", "basin_sig", "basin_name", "area_km2", "stations_thinned",
+                            "basin_buffer", "final_map", "run", "results_map", "results_map_sig"]:
+                    st.session_state.pop(key, None)
+                st.session_state["uploader_gen"] = st.session_state.get("uploader_gen", 0) + 1
+                st.rerun()
 
             col1, col2, col3, col4 = st.columns(4)
             col1.metric(T("Total area", "Área total"), f"{area_km2:,.0f} km²")
@@ -341,17 +371,28 @@ def run_app():
                 """
             ))
 
+        # Widgets forget their value when you leave this step, so seed each one with
+        # what was saved last time (st.session_state["params"] is rewritten below).
+        P = st.session_state.get("params", {})
+
+        if "basin" in st.session_state:
+            st.caption(T(f"📍 Basin loaded: {st.session_state.get('basin_name', '')}",
+                         f"📍 Cuenca cargada: {st.session_state.get('basin_name', '')}"))
+        else:
+            st.warning(T("No shapefile loaded yet — go to **1️⃣ Upload** first.",
+                         "Aún no hay shapefile — ve primero a **1️⃣ Upload**."))
+
         col1, col2, col3 = st.columns(3)
 
         with col1:
             st.markdown(T("**Search area**", "**Área de búsqueda**"))
             buffer_km = st.number_input(
-                T("Buffer (km)", "Buffer (km)"), 0, 100, 15,
+                T("Buffer (km)", "Buffer (km)"), 0, 100, int(P.get("buffer_km", 15)),
                 help=T("Expand search area beyond watershed boundary",
                        "Ampliar el área de búsqueda más allá de la cuenca")
             )
             min_year = st.number_input(
-                T("Minimum active year", "Año mínimo activo"), 1900, TODAY.year, 1900,
+                T("Minimum active year", "Año mínimo activo"), 1900, TODAY.year, int(P.get("min_year", 1900)),
                 help=T("Exclude stations that stopped recording before this year. "
                        "1900 keeps every station whose record overlaps your window.",
                        "Excluir estaciones que dejaron de registrar antes de este año. "
@@ -362,13 +403,13 @@ def run_app():
             st.markdown(T("**Calibration window**", "**Ventana de calibración**"))
             cal_start = st.date_input(
                 T("Calibration start", "Inicio de calibración"),
-                value=datetime.date(2010, 1, 1),
+                value=P.get("cal_start", datetime.date(2010, 1, 1)),
                 min_value=datetime.date(1900, 1, 1),
                 max_value=datetime.date(2100, 12, 31),
             )
             cal_end = st.date_input(
                 T("Calibration end", "Fin de calibración"),
-                value=datetime.date(2019, 12, 31),
+                value=P.get("cal_end", datetime.date(2019, 12, 31)),
                 min_value=datetime.date(1900, 1, 1),
                 max_value=datetime.date(2100, 12, 31),
             )
@@ -392,18 +433,18 @@ def run_app():
         with col3:
             st.markdown(T("**Quality filters**", "**Filtros de calidad**"))
             min_years = st.number_input(
-                T("Min years of data", "Años mínimos de datos"), 1, 130, 5,
+                T("Min years of data", "Años mínimos de datos"), 1, 130, int(P.get("min_years", 5)),
                 help=T("Minimum total record length",
                        "Longitud mínima total del registro")
             )
             min_cover = st.slider(
-                T("Coverage fraction", "Fracción de cobertura"), 0.0, 1.0, 0.7,
+                T("Coverage fraction", "Fracción de cobertura"), 0.0, 1.0, float(P.get("min_cover", 0.7)),
                 help=T("Fraction of calibration period the station must cover",
                        "Fracción del periodo de calibración que debe cubrir la estación")
             )
             min_dist_km = st.number_input(
                 T("Min station spacing (km)", "Distancia mínima entre estaciones (km)"),
-                1, 100, 25,
+                1, 100, int(P.get("min_dist_km", 25)),
                 help=T("Prevents redundant nearby stations",
                        "Evita estaciones redundantes cercanas")
             )
@@ -419,7 +460,7 @@ def run_app():
         token = st.text_input(
         T("🔑 NOAA API token", "🔑 Token NOAA API"),
         type="password",
-        key="token_step3"
+        value=P.get("token", ""),
         )
         
         st.session_state["params"] = {
@@ -598,60 +639,80 @@ def run_app():
                 """
             ))
 
-        stations     = stations_thinned.copy()
-        # Draw geometry only: uploaded shapefiles often carry date/time or other
-        # attribute columns that cannot be written to GeoJSON, which used to make
-        # the map crash for basins other than the bundled one.
-        basin_subs   = gpd.GeoDataFrame(
-            geometry=basin.geometry.simplify(0.0005), crs=4326)
-        basin_union  = basin.union_all()
-        basin_single = gpd.GeoDataFrame(geometry=[basin_union], crs=4326)
-        basin_buffer_geo = gpd.GeoDataFrame(geometry=basin_buffer.geometry, crs=4326)
+        # Build the folium map once per selection and keep it: rebuilding it (and
+        # re-sending ~3 MB of GeoJSON) on every Streamlit rerun was the slow part.
+        map_sig = (language, tuple(stations_thinned["id"]), len(basin),
+                   tuple(np.round(basin.total_bounds, 5)),
+                   tuple(np.round(basin_buffer.total_bounds, 5)))
+        if st.session_state.get("results_map_sig") != map_sig:
+            stations     = stations_thinned.copy()
+            # Draw geometry only: uploaded shapefiles often carry date/time or other
+            # attribute columns that cannot be written to GeoJSON, which used to make
+            # the map crash for basins other than the bundled one.
+            basin_subs   = gpd.GeoDataFrame(
+                geometry=basin.geometry.simplify(0.002).set_precision(1e-4), crs=4326)  # ~10 m: halves the GeoJSON
+            basin_union  = basin.union_all()
+            basin_single = gpd.GeoDataFrame(geometry=[basin_union], crs=4326)
+            basin_buffer_geo = gpd.GeoDataFrame(geometry=basin_buffer.geometry, crs=4326)
 
-        def color_from_band(band):
-            return {"baja": "blue", "media-baja": "green",
-                    "media-alta": "orange", "alta": "red"}.get(band, "gray")
+            def color_from_band(band):
+                return {"baja": "blue", "media-baja": "green",
+                        "media-alta": "orange", "alta": "red"}.get(band, "gray")
 
-        centroid = basin_union.centroid
-        m_final  = folium.Map(location=[centroid.y, centroid.x],
-                              zoom_start=7, tiles="CartoDB positron")
-        bw, bs, be, bn = basin_buffer_geo.total_bounds
-        m_final.fit_bounds([[bs, bw], [bn, be]])
+            centroid = basin_union.centroid
+            m_final  = folium.Map(location=[centroid.y, centroid.x],
+                                  zoom_start=7, tiles=None)
+            folium.TileLayer(tiles="OpenStreetMap", name="OpenStreetMap").add_to(m_final)
+            folium.TileLayer(
+                tiles=ESRI_TILES.format(svc="Canvas/World_Light_Gray_Base"),
+                attr="Tiles &copy; Esri", name="Light gray (Esri)",
+                max_zoom=16, show=False).add_to(m_final)
+            folium.TileLayer(
+                tiles=ESRI_TILES.format(svc="World_Imagery"),
+                attr="Tiles &copy; Esri, Maxar, Earthstar Geographics",
+                name="Satellite (Esri)", max_zoom=18, show=False).add_to(m_final)
+            bw, bs, be, bn = basin_buffer_geo.total_bounds
+            m_final.fit_bounds([[bs, bw], [bn, be]])
 
-        folium.GeoJson(
-            basin_single.to_json(), name=T("Basin", "Cuenca"),
-            style_function=lambda _: {"fillColor": "#3388ff", "fillOpacity": 0.05,
-                                       "color": "#003399", "weight": 2}
-        ).add_to(m_final)
-        folium.GeoJson(
-            basin_subs.to_json(), name=T("Subbasins", "Subcuencas"),
-            style_function=lambda _: {"fillOpacity": 0, "color": "#666", "weight": 1}
-        ).add_to(m_final)
-        folium.GeoJson(
-            basin_buffer_geo.to_json(), name=T("Buffer", "Buffer"),
-            style_function=lambda _: {"fillOpacity": 0, "color": "#f90",
-                                       "weight": 2, "dashArray": "6 4"}
-        ).add_to(m_final)
+            folium.GeoJson(
+                basin_single.to_json(), name=T("Basin", "Cuenca"),
+                style_function=lambda _: {"fillColor": "#3388ff", "fillOpacity": 0.05,
+                                           "color": "#003399", "weight": 2}
+            ).add_to(m_final)
+            folium.GeoJson(
+                basin_subs.to_json(), name=T("Subbasins", "Subcuencas"),
+                style_function=lambda _: {"fillOpacity": 0, "color": "#666", "weight": 1}
+            ).add_to(m_final)
+            folium.GeoJson(
+                basin_buffer_geo.to_json(), name=T("Buffer", "Buffer"),
+                style_function=lambda _: {"fillOpacity": 0, "color": "#f90",
+                                           "weight": 2, "dashArray": "6 4"}
+            ).add_to(m_final)
 
-        cluster = MarkerCluster(name=T("Stations", "Estaciones")).add_to(m_final)
-        for row in stations.itertuples():
-            band = getattr(row, "elev_band", "NA")
-            cov  = getattr(row, "cover_frac", float("nan"))
-            scr  = getattr(row, "score", float("nan"))
-            popup_html = (
-                f"<b>{html.escape(str(row.name))}</b><br>"
-                f"Elevation band: {band}<br>"
-                f"Coverage: {cov:.0%}<br>"
-                f"Score: {scr:.3f}"
-            )
-            folium.Marker(
-                location=[row.geometry.y, row.geometry.x],
-                popup=folium.Popup(popup_html, max_width=250),
-                icon=folium.Icon(color=color_from_band(band), icon="cloud"),
-            ).add_to(cluster)
+            cluster = MarkerCluster(name=T("Stations", "Estaciones")).add_to(m_final)
+            for row in stations.itertuples():
+                band = getattr(row, "elev_band", "NA")
+                cov  = getattr(row, "cover_frac", float("nan"))
+                scr  = getattr(row, "score", float("nan"))
+                popup_html = (
+                    f"<b>{html.escape(str(row.name))}</b><br>"
+                    f"Elevation band: {band}<br>"
+                    f"Coverage: {cov:.0%}<br>"
+                    f"Score: {scr:.3f}"
+                )
+                folium.Marker(
+                    location=[row.geometry.y, row.geometry.x],
+                    popup=folium.Popup(popup_html, max_width=250),
+                    icon=folium.Icon(color=color_from_band(band), icon="cloud"),
+                ).add_to(cluster)
 
-        folium.LayerControl().add_to(m_final)
-        st_folium(m_final, width=900, height=600)
+            folium.LayerControl().add_to(m_final)
+            st.session_state["results_map"]     = m_final
+            st.session_state["results_map_sig"] = map_sig
+        m_final = st.session_state["results_map"]
+        # returned_objects=[]: panning/zooming must NOT rerun the whole page.
+        st_folium(m_final, width=900, height=600, returned_objects=[],
+                  key="results_map_widget")
 
         # ── Narrative handoff ──────────────────────────────────────────────
         cal_s    = params.get("cal_start", "?")
