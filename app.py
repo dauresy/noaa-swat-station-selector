@@ -30,6 +30,7 @@ from scripts.download_noaa_yearly import download_noaa_yearly
 from scripts.make_map import make_map
 from scripts.noaa_single import get_station_daily_from_existing_workflow
 from scripts.export_swatplus import export_swatplus
+from scripts import session_store
 
 # Daily records on NOAA's server start as early as the 1800s; allow the full range.
 EARLIEST_DATE = datetime.date(1900, 1, 1)
@@ -204,6 +205,87 @@ def run_app():
         "🌧️ Selector de Estaciones Climáticas"
     ))
 
+    # ── Session recovery ───────────────────────────────────────────────────────
+    # Streamlit starts from scratch whenever a session resets (reconnect, app restart,
+    # page reload). The basin, parameters and station selection are therefore also kept
+    # on the server under a random code in the URL (?s=...) and restored from it.
+    # The NOAA token is never stored.
+    sid = st.query_params.get("s")
+    if not session_store.valid_token(sid):
+        sid = session_store.new_token()
+        st.query_params["s"] = sid
+    st.session_state["_sid"] = sid
+
+    if not st.session_state.get("_restore_tried"):
+        st.session_state["_restore_tried"] = True
+        session_store.purge_old()
+        saved = session_store.load_all(sid) if "basin" not in st.session_state else {}
+        if "basin" in saved:
+            ss_ = st.session_state
+            meta = saved.get("meta", {})
+            ss_["basin"]      = saved["basin"]
+            ss_["basin_name"] = meta.get("basin_name", "")
+            ss_["area_km2"]   = meta.get("area_km2") or                 saved["basin"].to_crs("EPSG:6933").geometry.area.sum() / 1e6
+            raw_sig = meta.get("basin_sig")
+            ss_["basin_sig"]  = tuple(tuple(x) for x in raw_sig) if raw_sig else None
+            if "params" in saved:
+                ss_["params"] = {**saved["params"], "token": ""}
+            if "stations" in saved and "buffer" in saved:
+                ss_["stations_thinned"] = saved["stations"]
+                ss_["basin_buffer"]     = saved["buffer"]
+            st.toast(T("♻️ Restored your previous basin, parameters and results "
+                       "(re-enter your NOAA token to run a new search).",
+                       "♻️ Se recuperaron tu cuenca, parámetros y resultados anteriores "
+                       "(vuelve a escribir tu token NOAA para hacer otra búsqueda)."))
+
+    def _persist():
+        """Write whatever changed since last time to the server (never breaks the app)."""
+        ss_ = st.session_state
+        sid_ = ss_.get("_sid")
+        if not session_store.valid_token(sid_):
+            return
+        done = ss_.setdefault("_persisted", {})
+        try:
+            if "basin" not in ss_:
+                if done:
+                    session_store.delete_session(sid_)
+                    done.clear()
+                return
+            sig = ss_.get("basin_sig") or ("n", len(ss_["basin"]))
+            if done.get("basin") != sig:
+                session_store.save_part(sid_, "basin", ss_["basin"])
+                bs = ss_.get("basin_sig")
+                session_store.save_part(sid_, "meta", {
+                    "basin_name": ss_.get("basin_name", ""),
+                    "area_km2": float(ss_.get("area_km2", 0) or 0),
+                    "basin_sig": [list(x) for x in bs] if bs else None})
+                done["basin"] = sig
+
+            P_ = ss_.get("params")
+            if P_ is not None:
+                safe = {k: v for k, v in P_.items() if k != "token"}
+                psig = repr(sorted(safe.items()))
+                if done.get("params") != psig:
+                    session_store.save_part(sid_, "params", safe)
+                    done["params"] = psig
+
+            st_ = ss_.get("stations_thinned")
+            if st_ is not None and "basin_buffer" in ss_ and len(st_) and "id" in st_.columns:
+                ssig = (len(st_), tuple(st_["id"]),
+                        round(float(st_["score"].sum()), 4) if "score" in st_.columns else 0)
+                if done.get("stations") != ssig:
+                    session_store.save_part(sid_, "stations", st_)
+                    session_store.save_part(sid_, "buffer", ss_["basin_buffer"])
+                    done["stations"] = ssig
+            elif done.get("stations") is not None:
+                session_store.delete_part(sid_, "stations")
+                session_store.delete_part(sid_, "buffer")
+                done.pop("stations", None)
+        except Exception:
+            pass
+
+    _persist()
+
     step = st.sidebar.radio(
         T("Navigation", "Navegación"),
         ["1️⃣ Upload", "2️⃣ Parameters", "3️⃣ Results", "4️⃣ Analysis", "5️⃣ Export SWAT+"]
@@ -311,6 +393,8 @@ def run_app():
                 st.session_state["basin_name"] = os.path.basename(shp_path)
                 st.session_state["area_km2"]   = basin.to_crs("EPSG:6933").geometry.area.sum() / 1e6  # equal-area, any location
 
+        _persist()
+
         # ── Loaded basin (stays visible while you change parameters) ───────────
         if "basin" in st.session_state:
             basin    = st.session_state["basin"]
@@ -328,6 +412,7 @@ def run_app():
                             "basin_buffer", "final_map", "run", "results_map", "results_map_sig"]:
                     st.session_state.pop(key, None)
                 st.session_state["uploader_gen"] = st.session_state.get("uploader_gen", 0) + 1
+                _persist()      # basin is gone -> deletes the saved copy
                 st.rerun()
 
             col1, col2, col3, col4 = st.columns(4)
@@ -501,6 +586,7 @@ def run_app():
             "min_years": min_years, "min_cover": min_cover,
             "min_dist_km": min_dist_km, "token": token,
         }
+        _persist()
 
         run_button = st.button(
             T("🚀 Run NOAA Station Selection", "🚀 Ejecutar selección de estaciones NOAA"),
@@ -557,6 +643,7 @@ def run_app():
             st.session_state["stations_thinned"] = stations_thinned
             st.session_state["basin_buffer"]     = basin_buffer
             st.session_state["run"] = False
+            _persist()
 
         if not all(k in st.session_state for k in ["stations_thinned", "basin_buffer"]):
             st.info(T(

@@ -62,6 +62,15 @@ The token is only used as a fallback if that server is unreachable.
 Buffers, station spacing and basin area are computed in a projection chosen from the basin's own
 location, so basins outside Texas/New Mexico are measured correctly.
 
+## Your work survives a session reset
+
+The link carries a random code (`?s=...`). The loaded basin, your parameters and the station
+selection are saved on the server under that code and restored automatically if the session
+resets (reconnect, app restart, page reload) — keep or bookmark the link with the code.
+The NOAA token is never stored, so re-enter it to run a new search. Saved work is deleted
+after 7 days without use, or immediately with the **Remove** button on step 1. Anyone who has
+the full link can open that work, so don't share it publicly.
+
 ## Keeping the live app awake
 
 Streamlit Community Cloud puts apps to sleep after 12 hours without traffic. The workflow in
