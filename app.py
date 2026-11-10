@@ -51,15 +51,47 @@ def load_shapefile(shp_path):
     return gdf.to_crs(4326)
 
 
+def folder_sig(folder: str) -> tuple:
+    """Name, size and modification time of every CSV in a folder.
+
+    Passed to the cached loaders so they reload when a file is replaced
+    (st.cache_data keyed only on the folder/path kept serving the old data).
+    """
+    if not os.path.isdir(folder):
+        return ()
+    out = []
+    for f in sorted(os.listdir(folder)):
+        if f.endswith(".csv"):
+            st_ = os.stat(os.path.join(folder, f))
+            out.append((f, st_.st_size, st_.st_mtime_ns))
+    return tuple(out)
+
+
 @st.cache_data
-def load_station_data(path):
+def csv_span(path: str, mtime: float):
+    """(first_date, last_date) of a station CSV, read from its first and last lines."""
+    try:
+        with open(path, "rb") as fh:
+            fh.readline()                                   # header
+            first = fh.readline().decode(errors="ignore").split(",")[0]
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 400))
+            tail = fh.read().decode(errors="ignore").strip().splitlines()
+        last = tail[-1].split(",")[0] if tail else ""
+        return pd.to_datetime(first, errors="coerce"), pd.to_datetime(last, errors="coerce")
+    except OSError:
+        return pd.NaT, pd.NaT
+
+
+@st.cache_data
+def load_station_data(path, mtime=0.0):
     df = pd.read_csv(path)
     df["DATE"] = pd.to_datetime(df["DATE"])
     return df
 
 
 @st.cache_data
-def load_all_stations(noaa_folder: str) -> dict:
+def load_all_stations(noaa_folder: str, sig: tuple = ()) -> dict:
     """Load every CSV in noaa_folder into a dict keyed by station ID."""
     files = [f for f in os.listdir(noaa_folder) if f.endswith(".csv")]
     data = {}
@@ -73,7 +105,7 @@ def load_all_stations(noaa_folder: str) -> dict:
 
 
 @st.cache_data
-def load_all_noaa_daily(folder: str) -> pd.DataFrame:
+def load_all_noaa_daily(folder: str, sig: tuple = ()) -> pd.DataFrame:
     """Concatenate all CSVs in folder into a single DataFrame."""
     dfs = []
     for f in os.listdir(folder):
@@ -783,15 +815,64 @@ def run_app():
                           for f in os.listdir(noaa_folder) if f.endswith(".csv")}
         station_ids    = stations_thinned["id"].tolist() if "id" in stations_thinned.columns else []
 
-        already   = [s for s in station_ids if s in existing_files]
-        missing   = [s for s in station_ids if s not in existing_files]
-        extra     = [s for s in existing_files if s not in station_ids]
+        # Requested date range (chosen before the table so we can tell which files are cut short)
+        # NB: without min_value Streamlit only lets you go back 10 years from
+        # the default value (which is why this used to stop at 2000).
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            dl_start = st.date_input(
+                T("Download from", "Descargar desde"),
+                value=EARLIEST_DATE,
+                min_value=EARLIEST_DATE, max_value=TODAY,
+                key="dl_start",
+                help=T("Full station record: data are fetched from NOAA's GHCN-Daily "
+                       "files, which go back as far as each station reports (often before 1950).",
+                       "Registro completo de la estación: los datos vienen de los archivos "
+                       "GHCN-Daily de NOAA, que llegan hasta donde cada estación reporta "
+                       "(a menudo antes de 1950).")
+            )
+        with col_dl2:
+            dl_end = st.date_input(
+                T("Download to", "Descargar hasta"),
+                value=TODAY,
+                min_value=EARLIEST_DATE, max_value=TODAY,
+                key="dl_end"
+            )
+
+        # Inspect each existing file: a CSV that starts years after the station's first
+        # record (e.g. downloaded earlier with a 2010 start) is "partial" and is
+        # fetched again, instead of silently feeding 2010-only data to every figure.
+        dl_done = st.session_state.setdefault("dl_done", set())
+        info    = {}
+        for sid_dl in station_ids:
+            fpath_dl = os.path.join(noaa_folder, sid_dl.replace(":", "_") + ".csv")
+            if not os.path.exists(fpath_dl):
+                info[sid_dl] = {"state": "missing"}
+                continue
+            first, last = csv_span(fpath_dl, os.path.getmtime(fpath_dl))
+            row_st = stations_thinned[stations_thinned["id"] == sid_dl].iloc[0]
+            station_first = pd.to_datetime(row_st.get("mindate"), errors="coerce")
+            wanted_from   = max(pd.Timestamp(dl_start),
+                                station_first if pd.notna(station_first) else pd.Timestamp(dl_start))
+            partial = (pd.notna(first) and (first.year - wanted_from.year) > 1
+                       and (sid_dl, str(dl_start)) not in dl_done)
+            info[sid_dl] = {"state": "partial" if partial else "ok", "first": first, "last": last,
+                            "size_kb": os.path.getsize(fpath_dl) / 1024}
+
+        already  = [s for s in station_ids if info[s]["state"] in ("ok", "partial")]
+        missing  = [s for s in station_ids if info[s]["state"] == "missing"]
+        partial  = [s for s in station_ids if info[s]["state"] == "partial"]
+        to_get   = missing + partial
+        extra    = [s for s in existing_files if s not in station_ids]
 
         # Status metrics
-        col1, col2, col3 = st.columns(3)
-        col1.metric(T("✅ Downloaded",  "✅ Descargadas"),  len(already))
-        col2.metric(T("⬇️ Downloadable",     "⬇️ Disponibles para descargar"),    len(missing))
-        col3.metric(T("📦 Extra files", "📦 Archivos extra"), len(extra),
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric(T("✅ Downloaded",  "✅ Descargadas"),  len(already) - len(partial))
+        col2.metric(T("⚠️ Start too late", "⚠️ Empiezan tarde"), len(partial),
+                    help=T("Files that start years after the station's first record; they are downloaded again",
+                           "Archivos que empiezan años después del primer registro de la estación; se vuelven a descargar"))
+        col3.metric(T("⬇️ Downloadable",     "⬇️ Disponibles para descargar"),    len(missing))
+        col4.metric(T("📦 Extra files", "📦 Archivos extra"), len(extra),
                     help=T("Files in folder that are not in the current selection",
                            "Archivos en la carpeta que no están en la selección actual"))
 
@@ -820,66 +901,48 @@ def run_app():
                     match_dl = stations_thinned[stations_thinned["id"] == sid_dl]
                     if not match_dl.empty:
                         name_dl = match_dl.iloc[0]["name"]
-                fname_dl = sid_dl.replace(":", "_") + ".csv"
-                fpath_dl = os.path.join(noaa_folder, fname_dl)
-                exists   = os.path.exists(fpath_dl)
-                size_kb  = os.path.getsize(fpath_dl) / 1024 if exists else 0
+                inf = info[sid_dl]
+                label = {"ok":      T("✅ Downloaded", "✅ Descargada"),
+                         "partial": T("⚠️ Starts late", "⚠️ Empieza tarde"),
+                         "missing": T("⬇️ Downloadable", "⬇️ Disponible para descargar")}[inf["state"]]
+                has = inf["state"] != "missing"
                 status_rows.append({
                     T("Station", "Estación"):  name_dl,
                     "ID":                      sid_dl,
-                    T("Status", "Estado"):     T("✅ Downloaded", "✅ Descargada") if exists
-                                               else T("⬇️ Downloadable", "⬇️ Disponibles para descargar"),
-                    T("Size (KB)", "Tamaño (KB)"): f"{size_kb:.0f}" if exists else "—",
+                    T("Status", "Estado"):     label,
+                    T("Data from", "Datos desde"): inf["first"].date().isoformat() if has and pd.notna(inf["first"]) else "—",
+                    T("Data to", "Datos hasta"):   inf["last"].date().isoformat() if has and pd.notna(inf["last"]) else "—",
+                    T("Size (KB)", "Tamaño (KB)"): f"{inf['size_kb']:.0f}" if has else "—",
                 })
-            status_df = pd.DataFrame(status_rows)
-            st.dataframe(status_df, use_container_width=True)
+            st.dataframe(pd.DataFrame(status_rows), use_container_width=True)
 
-        # Download missing stations
-        if missing:
+        # Download missing (and cut-short) stations
+        if to_get:
             st.warning(T(
-                f"{len(missing)} station(s) have no local data file. "
-                "Download them below to use the Analysis tab.",
-                f"{len(missing)} estación(es) no tienen archivo local. "
-                "Descárgalas abajo para usar el tab de Análisis."
+                f"{len(missing)} station(s) have no local data file"
+                + (f" and {len(partial)} start years after their first record (they will be replaced)"
+                   if partial else "")
+                + ". Download them below to use the Analysis tab.",
+                f"{len(missing)} estación(es) no tienen archivo local"
+                + (f" y {len(partial)} empiezan años después de su primer registro (se reemplazarán)"
+                   if partial else "")
+                + ". Descárgalas abajo para usar el tab de Análisis."
             ))
 
             dl_token = params.get("token", "")
 
-            # NB: without min_value Streamlit only lets you go back 10 years from
-            # the default value (which is why this used to stop at 2000).
-            col_dl1, col_dl2 = st.columns(2)
-            with col_dl1:
-                dl_start = st.date_input(
-                    T("Download from", "Descargar desde"),
-                    value=EARLIEST_DATE,
-                    min_value=EARLIEST_DATE, max_value=TODAY,
-                    key="dl_start",
-                    help=T("Full station record: data are fetched from NOAA's GHCN-Daily "
-                           "files, which go back as far as each station reports (often before 1950).",
-                           "Registro completo de la estación: los datos vienen de los archivos "
-                           "GHCN-Daily de NOAA, que llegan hasta donde cada estación reporta "
-                           "(a menudo antes de 1950).")
-                )
-            with col_dl2:
-                dl_end = st.date_input(
-                    T("Download to", "Descargar hasta"),
-                    value=TODAY,
-                    min_value=EARLIEST_DATE, max_value=TODAY,
-                    key="dl_end"
-                )
-
-            if st.button(T(f"⬇️ Download {len(missing)} missing station(s)",
-                           f"⬇️ Descargar {len(missing)} estación(es) faltante(s)"),
+            if st.button(T(f"⬇️ Download {len(to_get)} station(s)",
+                           f"⬇️ Descargar {len(to_get)} estación(es)"),
                          type="primary"):
                 # no token needed: GHCN-Daily files are public (the token is only a fallback)
                 progress_bar = st.progress(0)
                 status_text  = st.empty()
                 errors       = []
 
-                for i, sid_dl in enumerate(missing):
+                for i, sid_dl in enumerate(to_get):
                     status_text.text(T(
-                        f"Downloading {i+1}/{len(missing)}: {sid_dl}…",
-                        f"Descargando {i+1}/{len(missing)}: {sid_dl}…"
+                        f"Downloading {i+1}/{len(to_get)}: {sid_dl}…",
+                        f"Descargando {i+1}/{len(to_get)}: {sid_dl}…"
                     ))
                     try:
                         from scripts.download_noaa_daily import download_noaa_daily
@@ -894,10 +957,11 @@ def run_app():
                         else:
                             fname_save = sid_dl.replace(":", "_") + ".csv"
                             df_dl.to_csv(os.path.join(noaa_folder, fname_save), index=False)
+                            dl_done.add((sid_dl, str(dl_start)))
                     except Exception as e:
                         errors.append(f"❌ {sid_dl}: {e}")
 
-                    progress_bar.progress((i + 1) / len(missing))
+                    progress_bar.progress((i + 1) / len(to_get))
 
                 status_text.empty()
 
@@ -906,7 +970,7 @@ def run_app():
                     for err in errors:
                         st.write(err)
 
-                n_downloaded = len(missing) - len(errors)
+                n_downloaded = len(to_get) - len(errors)
                 if n_downloaded > 0:
                     st.success(T(
                         f"✅ {n_downloaded} station(s) downloaded successfully to `{noaa_folder}/`.",
@@ -943,14 +1007,14 @@ def run_app():
 
         sid   = station_choice.split(" — ")[-1]
         fname = sid.replace(":", "_") + ".csv"
-        path  = os.path.join("noaa_raw", fname)
+        path  = os.path.join(st.session_state.get("noaa_folder_6b", "noaa_raw"), fname)
 
         if not os.path.exists(path):
             st.error(T(f"Data file not found: {path}",
                        f"Archivo no encontrado: {path}"))
             st.stop()
 
-        df  = load_station_data(path)
+        df  = load_station_data(path, os.path.getmtime(path))
         df2 = df.copy()
         df2["year"]   = df2["DATE"].dt.year
         df2["month"]  = df2["DATE"].dt.month
@@ -1273,7 +1337,7 @@ def run_app():
                               f"Carpeta no encontrada: {NOAA_FOLDER}"))
                 st.stop()
 
-            all_data = load_all_stations(NOAA_FOLDER)
+            all_data = load_all_stations(NOAA_FOLDER, folder_sig(NOAA_FOLDER))
             if not all_data:
                 st.info(T("No CSV files found in folder.",
                           "No se encontraron archivos CSV en la carpeta."))
@@ -1636,7 +1700,7 @@ def run_app():
             ))
 
         NOAA_FOLDER_6B = st.session_state.get("noaa_folder_6b", "noaa_raw")
-        df_all = load_all_noaa_daily(NOAA_FOLDER_6B)
+        df_all = load_all_noaa_daily(NOAA_FOLDER_6B, folder_sig(NOAA_FOLDER_6B))
 
         if df_all.empty:
             st.warning(T("No data found for climate verification.",
