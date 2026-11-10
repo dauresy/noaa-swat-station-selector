@@ -7,6 +7,7 @@ filter by quality, analyze climate, and export SWAT+ ready files.
 Run with:  streamlit run app.py
 """
 import datetime
+import html
 import os
 import tempfile
 
@@ -29,6 +30,10 @@ from scripts.download_noaa_yearly import download_noaa_yearly
 from scripts.make_map import make_map
 from scripts.noaa_single import get_station_daily_from_existing_workflow
 from scripts.export_swatplus import export_swatplus
+
+# Daily records on NOAA's server start as early as the 1800s; allow the full range.
+EARLIEST_DATE = datetime.date(1900, 1, 1)
+TODAY         = datetime.date.today()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -256,8 +261,7 @@ def run_app():
             # ── Basin diagnostics ──────────────────────────────────────────
             st.success(T("✅ Shapefile loaded!", "✅ ¡Shapefile cargado!"))
 
-            basin_utm    = basin.to_crs(32613)
-            area_km2     = basin_utm.geometry.area.sum() / 1e6
+            area_km2     = basin.to_crs("EPSG:6933").geometry.area.sum() / 1e6  # equal-area, any location
             n_subs       = len(basin)
             bounds       = basin.total_bounds
             rec_stations = max(4, int(area_km2 / 575))  # WMO plains standard
@@ -347,9 +351,11 @@ def run_app():
                        "Ampliar el área de búsqueda más allá de la cuenca")
             )
             min_year = st.number_input(
-                T("Minimum active year", "Año mínimo activo"), 1900, 2025, 2000,
-                help=T("Exclude stations that stopped recording before this year",
-                       "Excluir estaciones inactivas antes de este año")
+                T("Minimum active year", "Año mínimo activo"), 1900, TODAY.year, 1900,
+                help=T("Exclude stations that stopped recording before this year. "
+                       "1900 keeps every station whose record overlaps your window.",
+                       "Excluir estaciones que dejaron de registrar antes de este año. "
+                       "1900 conserva toda estación cuyo registro se solape con tu ventana.")
             )
 
         with col2:
@@ -386,7 +392,7 @@ def run_app():
         with col3:
             st.markdown(T("**Quality filters**", "**Filtros de calidad**"))
             min_years = st.number_input(
-                T("Min years of data", "Años mínimos de datos"), 1, 50, 5,
+                T("Min years of data", "Años mínimos de datos"), 1, 130, 5,
                 help=T("Minimum total record length",
                        "Longitud mínima total del registro")
             )
@@ -461,13 +467,19 @@ def run_app():
 
             with st.spinner(T("Downloading and filtering NOAA stations…",
                                "Descargando y filtrando estaciones NOAA…")):
-                stations_thinned, basin_buffer = select_stations(
-                    basin,
-                    params["buffer_km"], params["min_year"],
-                    params["cal_start"], params["cal_end"],
-                    params["min_years"], params["min_cover"],
-                    params["min_dist_km"], params["token"],
-                )
+                try:
+                    stations_thinned, basin_buffer = select_stations(
+                        basin,
+                        params["buffer_km"], params["min_year"],
+                        params["cal_start"], params["cal_end"],
+                        params["min_years"], params["min_cover"],
+                        params["min_dist_km"], params["token"],
+                    )
+                except Exception as exc:
+                    st.session_state["run"] = False
+                    st.error(T(f"❌ The NOAA station search failed: {exc}",
+                               f"❌ Falló la búsqueda de estaciones NOAA: {exc}"))
+                    st.stop()
 
             st.session_state["stations_thinned"] = stations_thinned
             st.session_state["basin_buffer"]     = basin_buffer
@@ -587,17 +599,24 @@ def run_app():
             ))
 
         stations     = stations_thinned.copy()
-        basin_subs   = basin.copy()
-        basin_union  = basin_subs.union_all()
+        # Draw geometry only: uploaded shapefiles often carry date/time or other
+        # attribute columns that cannot be written to GeoJSON, which used to make
+        # the map crash for basins other than the bundled one.
+        basin_subs   = gpd.GeoDataFrame(
+            geometry=basin.geometry.simplify(0.0005), crs=4326)
+        basin_union  = basin.union_all()
         basin_single = gpd.GeoDataFrame(geometry=[basin_union], crs=4326)
+        basin_buffer_geo = gpd.GeoDataFrame(geometry=basin_buffer.geometry, crs=4326)
 
         def color_from_band(band):
             return {"baja": "blue", "media-baja": "green",
                     "media-alta": "orange", "alta": "red"}.get(band, "gray")
 
-        centroid = basin_single.geometry.unary_union.centroid
+        centroid = basin_union.centroid
         m_final  = folium.Map(location=[centroid.y, centroid.x],
                               zoom_start=7, tiles="CartoDB positron")
+        bw, bs, be, bn = basin_buffer_geo.total_bounds
+        m_final.fit_bounds([[bs, bw], [bn, be]])
 
         folium.GeoJson(
             basin_single.to_json(), name=T("Basin", "Cuenca"),
@@ -609,7 +628,7 @@ def run_app():
             style_function=lambda _: {"fillOpacity": 0, "color": "#666", "weight": 1}
         ).add_to(m_final)
         folium.GeoJson(
-            basin_buffer.to_json(), name=T("Buffer", "Buffer"),
+            basin_buffer_geo.to_json(), name=T("Buffer", "Buffer"),
             style_function=lambda _: {"fillOpacity": 0, "color": "#f90",
                                        "weight": 2, "dashArray": "6 4"}
         ).add_to(m_final)
@@ -620,7 +639,7 @@ def run_app():
             cov  = getattr(row, "cover_frac", float("nan"))
             scr  = getattr(row, "score", float("nan"))
             popup_html = (
-                f"<b>{row.name}</b><br>"
+                f"<b>{html.escape(str(row.name))}</b><br>"
                 f"Elevation band: {band}<br>"
                 f"Coverage: {cov:.0%}<br>"
                 f"Score: {scr:.3f}"
@@ -765,68 +784,74 @@ def run_app():
 
             dl_token = params.get("token", "")
 
+            # NB: without min_value Streamlit only lets you go back 10 years from
+            # the default value (which is why this used to stop at 2000).
             col_dl1, col_dl2 = st.columns(2)
             with col_dl1:
                 dl_start = st.date_input(
                     T("Download from", "Descargar desde"),
-                    value=params.get("cal_start", datetime.date(2000, 1, 1)),
-                    key="dl_start"
+                    value=EARLIEST_DATE,
+                    min_value=EARLIEST_DATE, max_value=TODAY,
+                    key="dl_start",
+                    help=T("Full station record: data are fetched from NOAA's GHCN-Daily "
+                           "files, which go back as far as each station reports (often before 1950).",
+                           "Registro completo de la estación: los datos vienen de los archivos "
+                           "GHCN-Daily de NOAA, que llegan hasta donde cada estación reporta "
+                           "(a menudo antes de 1950).")
                 )
             with col_dl2:
                 dl_end = st.date_input(
                     T("Download to", "Descargar hasta"),
-                    value=params.get("cal_end", datetime.date(2024, 12, 31)),
+                    value=TODAY,
+                    min_value=EARLIEST_DATE, max_value=TODAY,
                     key="dl_end"
                 )
 
             if st.button(T(f"⬇️ Download {len(missing)} missing station(s)",
                            f"⬇️ Descargar {len(missing)} estación(es) faltante(s)"),
                          type="primary"):
-                if not dl_token:
-                    st.error(T("No NOAA token found. Go back to Step 2 and enter your token.",
-                               "No se encontró token NOAA. Vuelve al Paso 2 e ingresa tu token."))
-                else:
-                    progress_bar = st.progress(0)
-                    status_text  = st.empty()
-                    errors       = []
+                # no token needed: GHCN-Daily files are public (the token is only a fallback)
+                progress_bar = st.progress(0)
+                status_text  = st.empty()
+                errors       = []
 
-                    for i, sid_dl in enumerate(missing):
-                        status_text.text(T(
-                            f"Downloading {i+1}/{len(missing)}: {sid_dl}…",
-                            f"Descargando {i+1}/{len(missing)}: {sid_dl}…"
-                        ))
-                        try:
-                            from scripts.download_noaa_daily import download_noaa_daily
-                            df_dl = download_noaa_daily(
-                                sid_dl, dl_start, dl_end, token=dl_token
-                            )
-                            if df_dl.empty:
-                                errors.append(T(
-                                    f"⚠️ {sid_dl} — no data returned (check date range or token)",
-                                    f"⚠️ {sid_dl} — sin datos (revisa el rango de fechas o el token)"
-                                ))
-                            else:
-                                fname_save = sid_dl.replace(":", "_") + ".csv"
-                                df_dl.to_csv(os.path.join(noaa_folder, fname_save), index=False)
-                        except Exception as e:
-                            errors.append(f"❌ {sid_dl}: {e}")
+                for i, sid_dl in enumerate(missing):
+                    status_text.text(T(
+                        f"Downloading {i+1}/{len(missing)}: {sid_dl}…",
+                        f"Descargando {i+1}/{len(missing)}: {sid_dl}…"
+                    ))
+                    try:
+                        from scripts.download_noaa_daily import download_noaa_daily
+                        df_dl = download_noaa_daily(
+                            sid_dl, dl_start, dl_end, token=dl_token
+                        )
+                        if df_dl.empty:
+                            errors.append(T(
+                                f"⚠️ {sid_dl} — no data in this date range",
+                                f"⚠️ {sid_dl} — sin datos en este rango de fechas"
+                            ))
+                        else:
+                            fname_save = sid_dl.replace(":", "_") + ".csv"
+                            df_dl.to_csv(os.path.join(noaa_folder, fname_save), index=False)
+                    except Exception as e:
+                        errors.append(f"❌ {sid_dl}: {e}")
 
-                        progress_bar.progress((i + 1) / len(missing))
+                    progress_bar.progress((i + 1) / len(missing))
 
-                    status_text.empty()
+                status_text.empty()
 
-                    if errors:
-                        st.warning(T("Some stations had issues:", "Algunas estaciones tuvieron problemas:"))
-                        for err in errors:
-                            st.write(err)
+                if errors:
+                    st.warning(T("Some stations had issues:", "Algunas estaciones tuvieron problemas:"))
+                    for err in errors:
+                        st.write(err)
 
-                    n_downloaded = len(missing) - len(errors)
-                    if n_downloaded > 0:
-                        st.success(T(
-                            f"✅ {n_downloaded} station(s) downloaded successfully to `{noaa_folder}/`.",
-                            f"✅ {n_downloaded} estación(es) descargadas exitosamente en `{noaa_folder}/`."
-                        ))
-                        st.rerun()
+                n_downloaded = len(missing) - len(errors)
+                if n_downloaded > 0:
+                    st.success(T(
+                        f"✅ {n_downloaded} station(s) downloaded successfully to `{noaa_folder}/`.",
+                        f"✅ {n_downloaded} estación(es) descargadas exitosamente en `{noaa_folder}/`."
+                    ))
+                    st.rerun()
         else:
             st.success(T(
                 f"✅ All {len(already)} selected stations have local data files in `{noaa_folder}/`. "
@@ -1774,12 +1799,14 @@ def run_app():
             exp_start = st.date_input(
                 T("Export start date", "Fecha de inicio de exportación"),
                 value=params.get("cal_start", datetime.date(2000, 1, 1)),
+                min_value=EARLIEST_DATE, max_value=datetime.date(2100, 12, 31),
                 key="exp_start"
             )
         with col3:
             exp_end = st.date_input(
                 T("Export end date", "Fecha de fin de exportación"),
                 value=params.get("cal_end", datetime.date(2024, 12, 31)),
+                min_value=EARLIEST_DATE, max_value=datetime.date(2100, 12, 31),
                 key="exp_end"
             )
 

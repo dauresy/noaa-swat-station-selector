@@ -1,6 +1,51 @@
+import time
+
 import geopandas as gpd
 import pandas as pd
 import requests
+
+STATIONS_URL = "https://www.ncei.noaa.gov/cdo-web/api/v2/stations"
+
+
+def _fetch_all_stations(extent: str, token: str) -> list:
+    """Page through the CDO /stations endpoint, retrying on rate limits.
+
+    Raises RuntimeError with a readable message instead of silently returning a
+    truncated list (a bad token or a 429 used to look like "no stations found").
+    """
+    params = {"datasetid": "GHCND", "extent": extent, "limit": 1000, "offset": 1}
+    results = []
+
+    while True:
+        for attempt in range(6):
+            r = requests.get(STATIONS_URL, params=params,
+                             headers={"token": token}, timeout=60)
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            break
+        else:
+            raise RuntimeError(
+                f"NOAA CDO API kept answering HTTP {r.status_code}. "
+                "Wait a minute and try again (the API allows 5 requests/second "
+                "and 10,000/day per token).")
+
+        if r.status_code in (400, 401, 403):
+            raise RuntimeError(
+                f"NOAA CDO API rejected the request (HTTP {r.status_code}). "
+                "Check that your token is correct. " + r.text[:200])
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError("NOAA CDO API returned something that is not JSON: "
+                               + r.text[:200])
+
+        page = data.get("results", [])
+        results.extend(page)
+        if len(page) < params["limit"]:
+            return results
+        params["offset"] += params["limit"]
+        time.sleep(0.25)
 
 def select_stations(
     basin,
@@ -22,10 +67,14 @@ def select_stations(
     # ============================
     # 2. Buffer
     # ============================
+    # Local UTM zone for *this* basin (a fixed zone is only accurate in its own
+    # 6 degrees of longitude, so it distorted buffers and distances elsewhere).
+    utm_crs = basin_single.estimate_utm_crs()
+
     if buffer_km > 0:
-        basin_utm = basin_single.to_crs(32613)
+        basin_utm = basin_single.to_crs(utm_crs)
         basin_buffer = basin_utm.buffer(buffer_km * 1000)
-        basin_buffer = gpd.GeoDataFrame(geometry=basin_buffer, crs=32613).to_crs(4326)
+        basin_buffer = gpd.GeoDataFrame(geometry=basin_buffer, crs=utm_crs).to_crs(4326)
     else:
         basin_buffer = basin_single.copy()
 
@@ -33,34 +82,7 @@ def select_stations(
     # 3. Descargar estaciones NOAA
     # ============================
     west, south, east, north = basin_buffer.total_bounds
-    url = "https://www.ncei.noaa.gov/cdo-web/api/v2/stations"
-
-    params = {
-        "datasetid": "GHCND",
-        "extent": f"{south},{west},{north},{east}",
-        "limit": 1000
-    }
-
-    all_results = []
-    offset = 1
-
-    while True:
-        params["offset"] = offset
-        r = requests.get(url, params=params, headers={"token": token})
-
-        try:
-            json_data = r.json()
-        except:
-            print("NOAA devolvió algo que no es JSON")
-            print(r.text[:500])
-            break
-
-        data = json_data.get("results", [])
-        if not data:
-            break
-
-        all_results.extend(data)
-        offset += 1000
+    all_results = _fetch_all_stations(f"{south},{west},{north},{east}", token)
 
     stations = pd.DataFrame(all_results)
 
@@ -103,10 +125,13 @@ def select_stations(
     # 7. Filtros por fechas
     # ============================
     stations_inside = stations_inside[stations_inside["maxdate"].dt.year >= year_min]
+    if stations_inside.empty:
+        return gpd.GeoDataFrame(), basin_buffer
+    stations_inside = stations_inside.copy()
 
     cal_start_dt = pd.to_datetime(cal_start)
     cal_end_dt   = pd.to_datetime(cal_end)
-    cal_years    = cal_end_dt.year - cal_start_dt.year + 1
+    cal_years    = max(1, cal_end_dt.year - cal_start_dt.year + 1)
 
     def years_in_cal(row):
         if pd.isna(row["mindate"]) or pd.isna(row["maxdate"]):
@@ -116,9 +141,6 @@ def select_stations(
 
     stations_inside["years_in_cal"] = stations_inside.apply(years_in_cal, axis=1)
     stations_inside["cover_frac"] = stations_inside["years_in_cal"] / cal_years
-
-    # Filtro de recencia
-    stations_inside = stations_inside[stations_inside["maxdate"].dt.year >= 2010]
 
     # ============================
     # 8. Filtros finales
@@ -153,7 +175,7 @@ def select_stations(
     # ============================
     # 10. Thinning por distancia
     # ============================
-    st_utm = stations_filtered.to_crs(32613)
+    st_utm = stations_filtered.to_crs(utm_crs)
     selected_idx = []
     used = set()
     min_dist_m = min_dist_km * 1000

@@ -7,7 +7,7 @@ def make_map(stations, basin, buffer_km):
     basin_union = basin.union_all()
     basin_single = gpd.GeoDataFrame(geometry=[basin_union], crs=4326)
 
-    centroid = basin_single.geometry.unary_union.centroid
+    centroid = basin_single.geometry.union_all().centroid
 
     m = folium.Map(
         location=[centroid.y, centroid.x],
@@ -16,15 +16,16 @@ def make_map(stations, basin, buffer_km):
     )
 
     folium.GeoJson(
-        basin.to_json(),
+        basin[[basin.geometry.name]].to_json(),
         name="Subbasins",
         style_function=lambda x: {"color": "#555", "weight": 1, "fillOpacity": 0.1}
     ).add_to(m)
 
     if buffer_km > 0:
-        basin_utm = basin_single.to_crs(32613)
+        utm_crs = basin_single.estimate_utm_crs()
+        basin_utm = basin_single.to_crs(utm_crs)
         buffer = basin_utm.buffer(buffer_km * 1000)
-        buffer = gpd.GeoDataFrame(geometry=buffer, crs=32613).to_crs(4326)
+        buffer = gpd.GeoDataFrame(geometry=buffer, crs=utm_crs).to_crs(4326)
 
         folium.GeoJson(
             buffer.to_json(),

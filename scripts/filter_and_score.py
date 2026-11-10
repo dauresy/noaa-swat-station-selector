@@ -74,7 +74,7 @@ def filter_and_score(stations, min_year, cal_start, cal_end, min_years, min_cove
     g_st = g_st.sort_values("score", ascending=False)
 
     # ⭐ THINNING POR DISTANCIA
-    st_utm = g_st.to_crs(32613)
+    st_utm = g_st.to_crs(g_st.estimate_utm_crs())
     selected_idx = []
     used = set()
     min_dist_m = min_dist_km * 1000

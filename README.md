@@ -45,12 +45,29 @@ streamlit run app.py
 
 ## NOAA API Token
 
-This app queries the **NOAA Climate Data Online (CDO) API** to download station metadata and daily records. A free token is required.
+The station **search** uses the **NOAA Climate Data Online (CDO) API**, which requires a free token.
 
 **Get your free token here (30 seconds):**  
 👉 https://www.ncdc.noaa.gov/cdo-web/token
 
 Paste it in the app when prompted. The token is never saved to disk.
+
+The **daily data download** does not need the token: each station's full GHCN-Daily record is fetched
+in one request from NOAA's public file server, so any start date from **1900** onwards works
+(the CDO API would need one request per year and is capped at 10,000 requests a day).
+The token is only used as a fallback if that server is unreachable.
+
+## Works anywhere in the U.S.
+
+Buffers, station spacing and basin area are computed in a projection chosen from the basin's own
+location, so basins outside Texas/New Mexico are measured correctly.
+
+## Keeping the live app awake
+
+Streamlit Community Cloud puts apps to sleep after 12 hours without traffic. The workflow in
+`.github/workflows/keepalive.yml` opens the app in a headless browser every 6 hours (and clicks
+"Yes, get this app back up!" if it finds the app asleep). It targets
+`https://noaa-station-selector.streamlit.app/`; set a repository variable `STREAMLIT_URL` to change it.
 
 ---
 

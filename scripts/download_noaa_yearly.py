@@ -13,13 +13,13 @@ def download_noaa_yearly(station_id: str, start_year: int, end_year: int,
     start_year : int
     end_year   : int
     token      : str   NOAA CDO API token (https://www.ncdc.noaa.gov/cdo-web/token)
-                       Falls back to the project token if empty — replace with your own.
+                       Required: no token is bundled with the code.
     """
 
-    # ── Token resolution ──────────────────────────────────────────────────────
-    # If the caller passes a token (from the Streamlit UI), use it.
-    # Otherwise fall back to the project token so existing scripts keep working.
-    _token = token.strip() if token and token.strip() else "CHSymOnkMgrHkRUcybaxSZEAVEFQUgmq"
+    _token = token.strip() if token else ""
+    if not _token:
+        raise ValueError("A NOAA CDO API token is required "
+                         "(https://www.ncdc.noaa.gov/cdo-web/token).")
 
     url     = "https://www.ncei.noaa.gov/cdo-web/api/v2/data"
     headers = {"token": _token}

@@ -1,0 +1,51 @@
+name: Streamlit Keepalive
+
+on:
+  schedule:
+    # Streamlit Community Cloud puts an app to sleep after 12 hours without
+    # traffic. Ping every 6 hours so scheduled-run delays (GitHub Actions cron
+    # can lag by tens of minutes) never let the app cross that threshold.
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: streamlit-keepalive
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # only used by the "keep schedule enabled" step below
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r .github/scripts/requirements.txt
+
+      - name: Install Playwright browser
+        run: playwright install --with-deps chromium
+
+      - name: Ping app
+        env:
+          # Override with a repository variable STREAMLIT_URL if the app moves.
+          STREAMLIT_URL: ${{ vars.STREAMLIT_URL || 'https://noaa-station-selector.streamlit.app/' }}
+        run: python .github/scripts/keepalive.py
+
+      # GitHub disables scheduled workflows after 60 days without repository
+      # activity. Re-enabling the workflow through the API counts as activity,
+      # so the schedule keeps running even if nobody commits. Best effort.
+      - name: Keep schedule enabled
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/keepalive.yml/enable"

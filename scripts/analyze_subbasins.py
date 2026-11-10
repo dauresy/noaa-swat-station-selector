@@ -6,8 +6,9 @@ def analyze_subbasins(stations, basin):
     st_in_sub = gpd.sjoin(stations, basin, predicate="within", how="left")
     sub_counts = st_in_sub.groupby("Subbasin").size().rename("n_stations").reset_index()
 
-    sub_utm = basin.to_crs(32613).copy()
-    st_utm = stations.to_crs(32613).copy()
+    utm_crs = basin.estimate_utm_crs()
+    sub_utm = basin.to_crs(utm_crs).copy()
+    st_utm = stations.to_crs(utm_crs).copy()
 
     sub_utm["centroid"] = sub_utm.geometry.centroid
     sub_utm["cx"] = sub_utm["centroid"].x
