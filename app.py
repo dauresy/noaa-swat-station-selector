@@ -8,8 +8,10 @@ Run with:  streamlit run app.py
 """
 import datetime
 import html
+import io
 import os
 import tempfile
+import zipfile
 
 import folium
 import geopandas as gpd
@@ -1002,6 +1004,42 @@ def run_app():
                     T("Size (KB)", "Tamaño (KB)"): f"{inf['size_kb']:.0f}" if has else "—",
                 })
             st.dataframe(pd.DataFrame(status_rows), use_container_width=True)
+
+        # The CSVs live in `noaa_folder` on the machine that runs the app. When the app is
+        # hosted (Streamlit Cloud) that is the server, not this computer, so offer them
+        # as a ZIP that the browser can save to the Downloads folder.
+        if already:
+            zip_files = [(sid_z, os.path.join(noaa_folder, sid_z.replace(":", "_") + ".csv"))
+                         for sid_z in already]
+            zip_sig = tuple((p_, os.path.getmtime(p_)) for _, p_ in zip_files)
+            zc1, zc2 = st.columns([1, 1])
+            if zc1.button(T(f"📦 Prepare ZIP of {len(zip_files)} station file(s)",
+                            f"📦 Preparar ZIP de {len(zip_files)} archivo(s) de estaciones")):
+                with st.spinner(T("Zipping station files…", "Comprimiendo archivos de estaciones…")):
+                    buf = io.BytesIO()
+                    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                        for _, path_z in zip_files:
+                            zf.write(path_z, arcname=os.path.basename(path_z))
+                        list_cols = [c for c in ["name", "id", "elevation", "elev_band", "span_years",
+                                                 "cover_frac", "score", "mindate", "maxdate"]
+                                     if c in stations_thinned.columns]
+                        zf.writestr("selected_stations.csv",
+                                    stations_thinned[list_cols].to_csv(index=False))
+                st.session_state["zip_data"] = (zip_sig, buf.getvalue())
+            zip_data = st.session_state.get("zip_data")
+            if zip_data and zip_data[0] == zip_sig:
+                zc2.download_button(
+                    T(f"⬇️ Download station data (ZIP, {len(zip_data[1]) / 1e6:.1f} MB)",
+                      f"⬇️ Descargar datos de estaciones (ZIP, {len(zip_data[1]) / 1e6:.1f} MB)"),
+                    data=zip_data[1],
+                    file_name=f"noaa_station_data_{len(zip_files)}_stations.zip",
+                    mime="application/zip",
+                    type="primary")
+            st.caption(T(
+                f"Files are saved on the computer that runs the app, in `{noaa_folder}/`. "
+                "On the hosted app that is the server, so use this ZIP to get a copy.",
+                f"Los archivos se guardan en el equipo que ejecuta la app, en `{noaa_folder}/`. "
+                "En la app en línea es el servidor, así que usa este ZIP para tener una copia."))
 
         # Download missing (and cut-short) stations
         if to_get:
